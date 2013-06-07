@@ -1,8 +1,8 @@
 {
   'variables': {
     'visibility%': 'hidden',         # V8's visibility setting
-    'target_arch%': 'ia32',          # set v8's target architecture
-    'host_arch%': 'ia32',            # set v8's host architecture
+    'target_arch%': 'x64',          # set v8's target architecture
+    'host_arch%': 'x64',            # set v8's host architecture
     'want_separate_host_toolset': 0, # V8 should not build target and host
     'library%': 'static_library',    # allow override to 'shared_library' for DLL/.so builds
     'component%': 'static_library',  # NB. these names match with what V8 expects
@@ -30,7 +30,7 @@
     'configurations': {
       'Debug': {
         'defines': [ 'DEBUG', '_DEBUG' ],
-        'cflags': [ '-g', '-O0' ],
+        'cflags': [ '-g', '-Os' ],
         'conditions': [
           ['target_arch=="x64"', {
             'msvs_configuration_platform': 'x64',
@@ -58,11 +58,11 @@
             'msvs_configuration_platform': 'x64',
           }],
           ['node_unsafe_optimizations==1', {
-            'cflags': [ '-O3', '-ffunction-sections', '-fdata-sections' ],
+            'cflags': [ '-Os', '-ffunction-sections', '-fdata-sections' ],
             'ldflags': [ '-Wl,--gc-sections' ],
           }, {
-            'cflags': [ '-O2', '-fno-strict-aliasing' ],
-            'cflags!': [ '-O3', '-fstrict-aliasing' ],
+            'cflags': [ '-Os', '-fno-strict-aliasing' ],
+            'cflags!': [ '-Os', '-fstrict-aliasing' ],
             'conditions': [
               # Required by the dtrace post-processor. Unfortunately,
               # some gcc/binutils combos generate bad code when

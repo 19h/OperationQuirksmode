@@ -21,7 +21,24 @@
                 e.processChannel();
                 e.resolveArgv0();
 
-                return b.stdout.write(typeof util + "\n")
+                log = function (v) {return process.stdout.write(v+"\n")}
+
+                r = c.require
+                u = r("util")
+
+                eS = function (c) {
+                        var b = Array(c), e;
+                        b[0] = 0;
+                        b[1] = 1;
+                        for (var a = 2; a < c; a++) 0 === (a + 1) % 2 ? b[a] = 0 : b[a] = 1;
+                        for (a = 2; a <= c; a += 2) if (b[a]) for (var d = 2 * (a + 1); d <= c; d += a + 1) b[d - 1] = 0;
+                        for (a = 1; a <= c; a++) 1 === b[a] && (e = a + 1);
+                        return e
+                };
+
+                v=process.hrtime();
+                eS(1E7);
+                log((z=process.hrtime(v), (z[0]+"."+1E9*z[1])))
         }
 
         function m(a, b) {
