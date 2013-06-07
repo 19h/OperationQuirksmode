@@ -2428,144 +2428,6 @@ void Load(Handle<Object> process_l) {
   }
 }
 
-static void PrintHelp();
-
-static void ParseDebugOpt(const char* arg) {
-  const char *p = 0;
-
-  if (strstr(arg, "--debug-port=") == arg) {
-    p = 1 + strchr(arg, '=');
-    debug_port = atoi(p);
-  } else {
-    use_debug_agent = true;
-    if (!strcmp (arg, "--debug-brk")) {
-      debug_wait_connect = true;
-      return;
-    } else if (!strcmp(arg, "--debug")) {
-      return;
-    } else if (strstr(arg, "--debug-brk=") == arg) {
-      debug_wait_connect = true;
-      p = 1 + strchr(arg, '=');
-      debug_port = atoi(p);
-    } else if (strstr(arg, "--debug=") == arg) {
-      p = 1 + strchr(arg, '=');
-      debug_port = atoi(p);
-    }
-  }
-  if (p && debug_port > 1024 && debug_port <  65536)
-      return;
-
-  fprintf(stderr, "Bad debug option.\n");
-  if (p) fprintf(stderr, "Debug port must be in range 1025 to 65535.\n");
-
-  PrintHelp();
-  exit(12);
-}
-
-static void PrintHelp() {
-  printf("Usage: node [options] [ -e script | script.js ] [arguments] \n"
-         "       node debug script.js [arguments] \n"
-         "\n"
-         "Options:\n"
-         "  -v, --version        print node's version\n"
-         "  -e, --eval script    evaluate script\n"
-         "  -p, --print          evaluate script and print result\n"
-         "  -i, --interactive    always enter the REPL even if stdin\n"
-         "                       does not appear to be a terminal\n"
-         "  --no-deprecation     silence deprecation warnings\n"
-         "  --trace-deprecation  show stack traces on deprecations\n"
-         "  --v8-options         print v8 command line options\n"
-         "  --max-stack-size=val set max v8 stack size (bytes)\n"
-         "\n"
-         "Environment variables:\n"
-#ifdef _WIN32
-         "NODE_PATH              ';'-separated list of directories\n"
-#else
-         "NODE_PATH              ':'-separated list of directories\n"
-#endif
-         "                       prefixed to the module search path.\n"
-         "NODE_MODULE_CONTEXTS   Set to 1 to load modules in their own\n"
-         "                       global contexts.\n"
-         "NODE_DISABLE_COLORS    Set to 1 to disable colors in the REPL\n"
-         "\n"
-         "Documentation can be found at http://nodejs.org/\n");
-}
-
-
-// Parse node command line arguments.
-static void ParseArgs(int argc, char **argv) {
-  int i;
-
-  // TODO use parse opts
-  for (i = 1; i < argc; i++) {
-    const char *arg = argv[i];
-    if (strstr(arg, "--debug") == arg) {
-      ParseDebugOpt(arg);
-      argv[i] = const_cast<char*>("");
-    } else if (strcmp(arg, "--version") == 0 || strcmp(arg, "-v") == 0) {
-      printf("%s\n", NODE_VERSION);
-      exit(0);
-    } else if (strstr(arg, "--max-stack-size=") == arg) {
-      const char *p = 0;
-      p = 1 + strchr(arg, '=');
-      max_stack_size = atoi(p);
-      argv[i] = const_cast<char*>("");
-    } else if (strcmp(arg, "--help") == 0 || strcmp(arg, "-h") == 0) {
-      PrintHelp();
-      exit(0);
-    } else if (strcmp(arg, "--eval") == 0   ||
-               strcmp(arg, "-e") == 0       ||
-               strcmp(arg, "--print") == 0  ||
-               strcmp(arg, "-pe") == 0      ||
-               strcmp(arg, "-p") == 0) {
-      bool is_eval = strchr(arg, 'e') != NULL;
-      bool is_print = strchr(arg, 'p') != NULL;
-
-      // argument to -p and --print is optional
-      if (is_eval == true && i + 1 >= argc) {
-        fprintf(stderr, "Error: %s requires an argument\n", arg);
-        exit(13);
-      }
-
-      print_eval = print_eval || is_print;
-      argv[i] = const_cast<char*>("");
-
-      // --eval, -e and -pe always require an argument
-      if (is_eval == true) {
-        eval_string = argv[++i];
-        continue;
-      }
-
-      // next arg is the expression to evaluate unless it starts with:
-      //  - a dash, then it's another switch
-      //  - "\\-", then it's an escaped expression, drop the backslash
-      if (argv[i + 1] == NULL) continue;
-      if (argv[i + 1][0] == '-') continue;
-      eval_string = argv[++i];
-      if (strncmp(eval_string, "\\-", 2) == 0) ++eval_string;
-    } else if (strcmp(arg, "--interactive") == 0 || strcmp(arg, "-i") == 0) {
-      force_repl = true;
-      argv[i] = const_cast<char*>("");
-    } else if (strcmp(arg, "--v8-options") == 0) {
-      argv[i] = const_cast<char*>("--help");
-    } else if (strcmp(arg, "--no-deprecation") == 0) {
-      argv[i] = const_cast<char*>("");
-      no_deprecation = true;
-    } else if (strcmp(arg, "--trace-deprecation") == 0) {
-      argv[i] = const_cast<char*>("");
-      trace_deprecation = true;
-    } else if (strcmp(arg, "--throw-deprecation") == 0) {
-      argv[i] = const_cast<char*>("");
-      throw_deprecation = true;
-    } else if (argv[i][0] != '-') {
-      break;
-    }
-  }
-
-  option_end_index = i;
-}
-
-
 // Called from the main thread.
 static void DispatchDebugMessagesAsyncCallback(uv_async_t* handle, int status) {
   v8::Debug::ProcessDebugMessages();
@@ -2861,45 +2723,18 @@ char** Init(int argc, char *argv[]) {
                 EmitDebugEnabledAsyncCallback);
   uv_unref(reinterpret_cast<uv_handle_t*>(&emit_debug_enabled_async));
 
-  // Parse a few arguments which are specific to Node.
-  node::ParseArgs(argc, argv);
-  // Parse the rest of the args (up to the 'option_end_index' (where '--' was
-  // in the command line))
-  int v8argc = option_end_index;
-  char **v8argv = argv;
-
-  if (debug_wait_connect) {
-    // v8argv is a copy of argv up to the script file argument +2 if --debug-brk
-    // to expose the v8 debugger js object so that node.js can set
-    // a breakpoint on the first line of the startup script
-    v8argc += 2;
-    v8argv = new char*[v8argc];
-    memcpy(v8argv, argv, sizeof(*argv) * option_end_index);
-    v8argv[option_end_index] = const_cast<char*>("--expose_debug_as");
-    v8argv[option_end_index + 1] = const_cast<char*>("v8debug");
-  }
-
-  // For the normal stack which moves from high to low addresses when frames
-  // are pushed, we can compute the limit as stack_size bytes below the
-  // the address of a stack variable (e.g. &stack_var) as an approximation
-  // of the start of the stack (we're assuming that we haven't pushed a lot
-  // of frames yet).
   if (max_stack_size != 0) {
     uint32_t stack_var;
     ResourceConstraints constraints;
 
     uint32_t *stack_limit = &stack_var - (max_stack_size / sizeof(uint32_t));
     constraints.set_stack_limit(stack_limit);
-    SetResourceConstraints(&constraints); // Must be done before V8::Initialize
+    SetResourceConstraints(&constraints);
   }
-  V8::SetFlagsFromCommandLine(&v8argc, v8argv, false);
 
-  // Fetch a reference to the main isolate, so we have a reference to it
-  // even when we need it to access it from another (debugger) thread.
   node_isolate = Isolate::GetCurrent();
 
 #ifdef __POSIX__
-  // Ignore SIGPIPE
   RegisterSignalHandler(SIGPIPE, SIG_IGN);
   RegisterSignalHandler(SIGINT, SignalExit);
   RegisterSignalHandler(SIGTERM, SignalExit);
@@ -2913,13 +2748,12 @@ char** Init(int argc, char *argv[]) {
 
   V8::SetFatalErrorHandler(node::OnFatalError);
 
-  // If the --debug flag was specified then initialize the debug thread.
   if (use_debug_agent) {
     EnableDebug(debug_wait_connect);
   } else {
 #ifdef _WIN32
     RegisterDebugSignalHandler();
-#else // Posix
+#else 
     static uv_signal_t signal_watcher;
     uv_signal_init(uv_default_loop(), &signal_watcher);
     uv_signal_start(&signal_watcher, EnableDebugSignalHandler, SIGUSR1);
@@ -2963,7 +2797,6 @@ void AtExit(void (*cb)(void* arg), void* arg) {
 
 
 void EmitExit(v8::Handle<v8::Object> process_l) {
-  // process.emit('exit')
   process_l->Set(String::NewSymbol("_exiting"), True(node_isolate));
   Local<Value> args[] = { String::New("exit"), Integer::New(0, node_isolate) };
   MakeCallback(process, "emit", ARRAY_SIZE(args), args);

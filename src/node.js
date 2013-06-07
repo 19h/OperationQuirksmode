@@ -1,727 +1,371 @@
-
-
-// Hello, and welcome to hacking node.js!
-//
-// This file is invoked by node::Load in src/node.cc, and responsible for
-// bootstrapping the node.js core. Special caution is given to the performance
-// of the startup process, so many dependencies are invoked lazily.
-(function(process) {
-  this.global = this;
-
-  function startup() {
-    var EventEmitter = NativeModule.require('events').EventEmitter;
-
-    process.__proto__ = Object.create(EventEmitter.prototype, {
-      constructor: {
-        value: process.constructor
-      }
-    });
-    EventEmitter.call(process);
-
-    process.EventEmitter = EventEmitter; // process.EventEmitter is deprecated
-
-    // do this good and early, since it handles errors.
-    startup.processFatal();
-
-    startup.globalVariables();
-    startup.globalTimeouts();
-    startup.globalConsole();
-
-    startup.processAssert();
-    startup.processConfig();
-    startup.processNextTick();
-    startup.processStdio();
-    startup.processKillAndExit();
-    startup.processSignalHandlers();
-
-    startup.processChannel();
-
-    startup.resolveArgv0();
-
-    // There are various modes that Node can run in. The most common two
-    // are running from a script and running the REPL - but there are a few
-    // others like the debugger or running --eval arguments. Here we decide
-    // which mode we run in.
-
-    if (NativeModule.exists('_tpm')) {
-      // To allow people to extend Node in different ways, this hook allows
-      // one to drop a file lib/_third_party_main.js into the build
-      // directory which will be executed instead of Node's normal loading.
-      process.nextTick(function() {
-        NativeModule.require('_tpm');
-      });
-    } else {
-      process.exit(0);
-    }
-  }
-
-  startup.globalVariables = function() {
-    global.process = process;
-    global.global = global;
-    global.GLOBAL = global;
-    global.root = global;
-    global.Buffer = NativeModule.require('buffer').Buffer;
-    process.binding('buffer').setFastBufferConstructor(global.Buffer);
-    process.domain = null;
-    process._exiting = false;
-  };
-
-  startup.globalTimeouts = function() {
-    global.setTimeout = function() {
-      var t = NativeModule.require('timers');
-      return t.setTimeout.apply(this, arguments);
-    };
-
-    global.setInterval = function() {
-      var t = NativeModule.require('timers');
-      return t.setInterval.apply(this, arguments);
-    };
-
-    global.clearTimeout = function() {
-      var t = NativeModule.require('timers');
-      return t.clearTimeout.apply(this, arguments);
-    };
-
-    global.clearInterval = function() {
-      var t = NativeModule.require('timers');
-      return t.clearInterval.apply(this, arguments);
-    };
-
-    global.setImmediate = function() {
-      var t = NativeModule.require('timers');
-      return t.setImmediate.apply(this, arguments);
-    };
-
-    global.clearImmediate = function() {
-      var t = NativeModule.require('timers');
-      return t.clearImmediate.apply(this, arguments);
-    };
-  };
-
-  startup.globalConsole = function() {
-    global.__defineGetter__('console', function() {
-      return NativeModule.require('console');
-    });
-  };
-
-
-  startup._lazyConstants = null;
-
-  startup.lazyConstants = function() {
-    if (!startup._lazyConstants) {
-      startup._lazyConstants = process.binding('constants');
-    }
-    return startup._lazyConstants;
-  };
-
-  startup.processFatal = function() {
-    // call into the active domain, or emit uncaughtException,
-    // and exit if there are no listeners.
-    process._fatalException = function(er) {
-      var caught = false;
-      if (process.domain) {
-        var domain = process.domain;
-        var domainModule = NativeModule.require('domain');
-        var domainStack = domainModule._stack;
-
-        // ignore errors on disposed domains.
-        //
-        // XXX This is a bit stupid.  We should probably get rid of
-        // domain.dispose() altogether.  It's almost always a terrible
-        // idea.  --isaacs
-        if (domain._disposed)
-          return true;
-
-        er.domain = domain;
-        er.domainThrown = true;
-        // wrap this in a try/catch so we don't get infinite throwing
-        try {
-          // One of three things will happen here.
-          //
-          // 1. There is a handler, caught = true
-          // 2. There is no handler, caught = false
-          // 3. It throws, caught = false
-          //
-          // If caught is false after this, then there's no need to exit()
-          // the domain, because we're going to crash the process anyway.
-          caught = domain.emit('error', er);
-
-          // Exit all domains on the stack.  Uncaught exceptions end the
-          // current tick and no domains should be left on the stack
-          // between ticks.
-          var domainModule = NativeModule.require('domain');
-          domainStack.length = 0;
-          domainModule.active = process.domain = null;
-        } catch (er2) {
-          // The domain error handler threw!  oh no!
-          // See if another domain can catch THIS error,
-          // or else crash on the original one.
-          // If the user already exited it, then don't double-exit.
-          if (domain === domainModule.active)
-            domainStack.pop();
-          if (domainStack.length) {
-            var parentDomain = domainStack[domainStack.length - 1];
-            process.domain = domainModule.active = parentDomain;
-            caught = process._fatalException(er2);
-          } else
-            caught = false;
-        }
-      } else {
-        caught = process.emit('uncaughtException', er);
-      }
-      // if someone handled it, then great.  otherwise, die in C++ land
-      // since that means that we'll exit the process, emit the 'exit' event
-      if (!caught) {
-        try {
-          if (!process._exiting) {
-            process._exiting = true;
-            process.emit('exit', 1);
-          }
-        } catch (er) {
-          // nothing to be done about it at this point.
-        }
-      }
-      // if we handled an error, then make sure any ticks get processed
-      if (caught)
-        setImmediate(process._tickCallback);
-      return caught;
-    };
-  };
-
-  var assert;
-  startup.processAssert = function() {
-    // Note that calls to assert() are pre-processed out by JS2C for the
-    // normal build of node. They persist only in the node_g build.
-    // Similarly for debug().
-    assert = process.assert = function(x, msg) {
-      if (!x) throw new Error(msg || 'assertion error');
-    };
-  };
-
-  startup.processConfig = function() {
-    // used for `process.config`, but not a real module
-    var config = NativeModule._source.config;
-    delete NativeModule._source.config;
-
-    // strip the gyp comment line at the beginning
-    config = config.split('\n').slice(1).join('\n').replace(/'/g, '"');
-
-    process.config = JSON.parse(config, function(key, value) {
-      if (value === 'true') return true;
-      if (value === 'false') return false;
-      return value;
-    });
-  };
-
-  startup.processNextTick = function() {
-    var lastThrew = false;
-    var nextTickQueue = [];
-    var needSpinner = true;
-    var inTick = false;
-
-    // this infobox thing is used so that the C++ code in src/node.cc
-    // can have easy accesss to our nextTick state, and avoid unnecessary
-    // calls into process._tickCallback.
-    // order is [length, index]
-    // Never write code like this without very good reason!
-    var infoBox = process._tickInfoBox;
-    var length = 0;
-    var index = 1;
-
-    process.nextTick = nextTick;
-    // needs to be accessible from cc land
-    process._nextDomainTick = _nextDomainTick;
-    process._tickCallback = _tickCallback;
-    process._tickDomainCallback = _tickDomainCallback;
-
-    function Tock(cb, domain) {
-      this.callback = cb;
-      this.domain = domain;
-    }
-
-    function tickDone() {
-      if (infoBox[length] !== 0) {
-        if (infoBox[length] <= infoBox[index]) {
-          nextTickQueue = [];
-          infoBox[length] = 0;
-        } else {
-          nextTickQueue.splice(0, infoBox[index]);
-          infoBox[length] = nextTickQueue.length;
-        }
-      }
-      inTick = false;
-      infoBox[index] = 0;
-    }
-
-    // run callbacks that have no domain
-    // using domains will cause this to be overridden
-    function _tickCallback() {
-      var callback, nextTickLength, threw;
-
-      if (inTick) return;
-      if (infoBox[length] === 0) {
-        infoBox[index] = 0;
-        return;
-      }
-      inTick = true;
-
-      while (infoBox[index] < infoBox[length]) {
-        callback = nextTickQueue[infoBox[index]++].callback;
-        threw = true;
-        try {
-          callback();
-          threw = false;
-        } finally {
-          if (threw) tickDone();
-        }
-      }
-
-      tickDone();
-    }
-
-    function _tickDomainCallback() {
-      var nextTickLength, tock, callback;
-
-      if (lastThrew) {
-        lastThrew = false;
-        return;
-      }
-
-      if (inTick) return;
-      if (infoBox[length] === 0) {
-        infoBox[index] = 0;
-        return;
-      }
-      inTick = true;
-
-      while (infoBox[index] < infoBox[length]) {
-        tock = nextTickQueue[infoBox[index]++];
-        callback = tock.callback;
-        if (tock.domain) {
-          if (tock.domain._disposed) continue;
-          tock.domain.enter();
-        }
-        lastThrew = true;
-        try {
-          callback();
-          lastThrew = false;
-        } finally {
-          if (lastThrew) tickDone();
-        }
-        if (tock.domain)
-          tock.domain.exit();
-      }
-
-      tickDone();
-    }
-
-    function nextTick(callback) {
-      // on the way out, don't bother. it won't get fired anyway.
-      if (process._exiting)
-        return;
-
-      nextTickQueue.push(new Tock(callback, null));
-      infoBox[length]++;
-    }
-
-    function _nextDomainTick(callback) {
-      // on the way out, don't bother. it won't get fired anyway.
-      if (process._exiting)
-        return;
-
-      nextTickQueue.push(new Tock(callback, process.domain));
-      infoBox[length]++;
-    }
-  };
-
-  function evalScript(name) {
-    var Module = NativeModule.require('module');
-    var path = NativeModule.require('path');
-    var cwd = process.cwd();
-
-    var module = new Module(name);
-    module.filename = path.join(cwd, name);
-    module.paths = Module._nodeModulePaths(cwd);
-    var script = process._eval;
-    if (!Module._contextLoad) {
-      var body = script;
-      script = 'global.__filename = ' + JSON.stringify(name) + ';\n' +
-               'global.exports = exports;\n' +
-               'global.module = module;\n' +
-               'global.__dirname = __dirname;\n' +
-               'global.require = require;\n' +
-               'return require("vm").runInThisContext(' +
-               JSON.stringify(body) + ', ' +
-               JSON.stringify(name) + ', 0, true);\n';
-    }
-    var result = module._compile(script, name + '-wrapper');
-    if (process._print_eval) console.log(result);
-  }
-
-  function errnoException(errorno, syscall) {
-    // TODO make this more compatible with ErrnoException from src/node.cc
-    // Once all of Node is using this function the ErrnoException from
-    // src/node.cc should be removed.
-    var e = new Error(syscall + ' ' + errorno);
-    e.errno = e.code = errorno;
-    e.syscall = syscall;
-    return e;
-  }
-
-  function createWritableStdioStream(fd) {
-    var stream;
-    var tty_wrap = process.binding('tty_wrap');
-
-    // Note stream._type is used for test-module-load-list.js
-
-    switch (tty_wrap.guessHandleType(fd)) {
-      case 'TTY':
-        var tty = NativeModule.require('tty');
-        stream = new tty.WriteStream(fd);
-        stream._type = 'tty';
-
-        // Hack to have stream not keep the event loop alive.
-        // See https://github.com/joyent/node/issues/1726
-        if (stream._handle && stream._handle.unref) {
-          stream._handle.unref();
-        }
-        break;
-
-      case 'FILE':
-        var fs = NativeModule.require('fs');
-        stream = new fs.SyncWriteStream(fd);
-        stream._type = 'fs';
-        break;
-
-      case 'PIPE':
-      case 'TCP':
-        var net = NativeModule.require('net');
-        stream = new net.Socket({
-          fd: fd,
-          readable: false,
-          writable: true
-        });
-
-        // FIXME Should probably have an option in net.Socket to create a
-        // stream from an existing fd which is writable only. But for now
-        // we'll just add this hack and set the `readable` member to false.
-        // Test: ./node test/fixtures/echo.js < /etc/passwd
-        stream.readable = false;
-        stream.read = null;
-        stream._type = 'pipe';
-
-        // FIXME Hack to have stream not keep the event loop alive.
-        // See https://github.com/joyent/node/issues/1726
-        if (stream._handle && stream._handle.unref) {
-          stream._handle.unref();
-        }
-        break;
-
-      default:
-        // Probably an error on in uv_guess_handle()
-        throw new Error('Implement me. Unknown stream file type!');
-    }
-
-    // For supporting legacy API we put the FD here.
-    stream.fd = fd;
-
-    stream._isStdio = true;
-
-    return stream;
-  }
-
-  startup.processStdio = function() {
-    var stdin, stdout, stderr;
-
-    process.__defineGetter__('stdout', function() {
-      if (stdout) return stdout;
-      stdout = createWritableStdioStream(1);
-      stdout.destroy = stdout.destroySoon = function(er) {
-        er = er || new Error('process.stdout cannot be closed.');
-        stdout.emit('error', er);
-      };
-      if (stdout.isTTY) {
-        process.on('SIGWINCH', function() {
-          stdout._refreshSize();
-        });
-      }
-      return stdout;
-    });
-
-    process.__defineGetter__('stderr', function() {
-      if (stderr) return stderr;
-      stderr = createWritableStdioStream(2);
-      stderr.destroy = stderr.destroySoon = function(er) {
-        er = er || new Error('process.stderr cannot be closed.');
-        stderr.emit('error', er);
-      };
-      return stderr;
-    });
-
-    process.__defineGetter__('stdin', function() {
-      if (stdin) return stdin;
-
-      var tty_wrap = process.binding('tty_wrap');
-      var fd = 0;
-
-      switch (tty_wrap.guessHandleType(fd)) {
-        case 'TTY':
-          var tty = NativeModule.require('tty');
-          stdin = new tty.ReadStream(fd, {
-            highWaterMark: 0,
-            readable: true,
-            writable: false
-          });
-          break;
-
-        case 'FILE':
-          var fs = NativeModule.require('fs');
-          stdin = new fs.ReadStream(null, { fd: fd });
-          break;
-
-        case 'PIPE':
-        case 'TCP':
-          var net = NativeModule.require('net');
-          stdin = new net.Socket({
-            fd: fd,
-            readable: true,
-            writable: false
-          });
-          break;
-
-        default:
-          // Probably an error on in uv_guess_handle()
-          throw new Error('Implement me. Unknown stdin file type!');
-      }
-
-      // For supporting legacy API we put the FD here.
-      stdin.fd = fd;
-
-      // stdin starts out life in a paused state, but node doesn't
-      // know yet.  Explicitly to readStop() it to put it in the
-      // not-reading state.
-      if (stdin._handle && stdin._handle.readStop) {
-        stdin._handle.reading = false;
-        stdin._readableState.reading = false;
-        stdin._handle.readStop();
-      }
-
-      // if the user calls stdin.pause(), then we need to stop reading
-      // immediately, so that the process can close down.
-      stdin.on('pause', function() {
-        if (!stdin._handle)
-          return;
-        stdin._readableState.reading = false;
-        stdin._handle.reading = false;
-        stdin._handle.readStop();
-      });
-
-      return stdin;
-    });
-
-    process.openStdin = function() {
-      process.stdin.resume();
-      return process.stdin;
-    };
-  };
-
-  startup.processKillAndExit = function() {
-    process.exit = function(code) {
-      if (!process._exiting) {
-        process._exiting = true;
-        process.emit('exit', code || 0);
-      }
-      process.reallyExit(code || 0);
-    };
-
-    process.kill = function(pid, sig) {
-      var r;
-
-      // preserve null signal
-      if (0 === sig) {
-        r = process._kill(pid, 0);
-      } else {
-        sig = sig || 'SIGTERM';
-        if (startup.lazyConstants()[sig]) {
-          r = process._kill(pid, startup.lazyConstants()[sig]);
-        } else {
-          throw new Error('Unknown signal: ' + sig);
-        }
-      }
-
-      if (r) {
-        throw errnoException(process._errno, 'kill');
-      }
-
-      return true;
-    };
-  };
-
-  startup.processSignalHandlers = function() {
-    // Load events module in order to access prototype elements on process like
-    // process.addListener.
-    var signalWraps = {};
-    var addListener = process.addListener;
-    var removeListener = process.removeListener;
-
-    function isSignal(event) {
-      return event.slice(0, 3) === 'SIG' &&
-             startup.lazyConstants().hasOwnProperty(event);
-    }
-
-    // Wrap addListener for the special signal types
-    process.on = process.addListener = function(type, listener) {
-      if (isSignal(type) &&
-          !signalWraps.hasOwnProperty(type)) {
-        var Signal = process.binding('signal_wrap').Signal;
-        var wrap = new Signal();
-
-        wrap.unref();
-
-        wrap.onsignal = function() { process.emit(type); };
-
-        var signum = startup.lazyConstants()[type];
-        var r = wrap.start(signum);
-        if (r) {
-          wrap.close();
-          throw errnoException(process._errno, 'uv_signal_start');
+(function (b) {
+        function e() {
+                var a = c.require("events").EventEmitter;
+                b.__proto__ = Object.create(a.prototype, {
+                                constructor: {
+                                        value: b.constructor
+                                }
+                        });
+                a.call(b);
+                b.EventEmitter = a;
+                e.processFatal();
+                e.globalVariables();
+                e.globalTimeouts();
+                e.globalConsole();
+                e.processAssert();
+                e.processConfig();
+                e.processNextTick();
+                e.processStdio();
+                e.processKillAndExit();
+                e.processSignalHandlers();
+                e.processChannel();
+                e.resolveArgv0();
+
+                return b.stdout.write(typeof util + "\n")
         }
 
-        signalWraps[type] = wrap;
-      }
-
-      return addListener.apply(this, arguments);
-    };
-
-    process.removeListener = function(type, listener) {
-      var ret = removeListener.apply(this, arguments);
-      if (isSignal(type)) {
-        assert(signalWraps.hasOwnProperty(type));
-
-        if (this.listeners(type).length === 0) {
-          signalWraps[type].close();
-          delete signalWraps[type];
+        function m(a, b) {
+                var c = Error(b + " " + a);
+                c.errno = c.code = a;
+                c.syscall = b;
+                return c
         }
-      }
 
-      return ret;
-    };
-  };
+        function n(a) {
+                var d;
+                switch (b.binding("tty_wrap").guessHandleType(a)) {
+                case "TTY":
+                        d = new(c.require("tty").WriteStream)(a);
+                        d._type = "tty";
+                        d._handle && d._handle.unref && d._handle.unref();
+                        break;
+                case "FILE":
+                        d = new(c.require("fs").SyncWriteStream)(a);
+                        d._type = "fs";
+                        break;
+                case "PIPE":
+                case "TCP":
+                        d = new(c.require("net").Socket)({
+                                        fd: a,
+                                        readable: !1,
+                                        writable: !0
+                                });
+                        d.readable = !1;
+                        d.read = null;
+                        d._type = "pipe";
+                        d._handle && d._handle.unref && d._handle.unref();
+                        break;
+                default:
+                        throw Error("Implement me. Unknown stream file type!");
+                }
+                d.fd = a;
+                d._isStdio = !0;
+                return d
+        }
 
+        function c(a) {
+                this.filename = a + ".js";
+                this.id = a;
+                this.exports = {};
+                this.loaded = !1
+        }
+        this.global = this;
+        e.globalVariables = function () {
+                global.process = b;
+                global.global = global;
+                global.GLOBAL = global;
+                global.root = global;
+                global.Buffer = c.require("buffer").Buffer;
+                b.binding("buffer").setFastBufferConstructor(global.Buffer);
+                b.domain = null;
+                b._exiting = !1
+        };
+        e.globalTimeouts = function () {
+                global.setTimeout = function () {
+                        return c.require("timers").setTimeout.apply(this, arguments)
+                };
+                global.setInterval = function () {
+                        return c.require("timers").setInterval.apply(this,
+                                arguments)
+                };
+                global.clearTimeout = function () {
+                        return c.require("timers").clearTimeout.apply(this, arguments)
+                };
+                global.clearInterval = function () {
+                        return c.require("timers").clearInterval.apply(this, arguments)
+                };
+                global.setImmediate = function () {
+                        return c.require("timers").setImmediate.apply(this, arguments)
+                };
+                global.clearImmediate = function () {
+                        return c.require("timers").clearImmediate.apply(this, arguments)
+                }
+        };
+        e.globalConsole = function () {
+                global.__defineGetter__("console", function () {
+                        return c.require("console")
+                })
+        };
+        e._lazyConstants =
+                null;
+        e.lazyConstants = function () {
+                e._lazyConstants || (e._lazyConstants = b.binding("constants"));
+                return e._lazyConstants
+        };
+        e.processFatal = function () {
+                b._fatalException = function (a) {
+                        var d = !1;
+                        if (b.domain) {
+                                var e = b.domain,
+                                        k = c.require("domain"),
+                                        h = k._stack;
+                                if (e._disposed) return !0;
+                                a.domain = e;
+                                a.domainThrown = !0;
+                                try {
+                                        d = e.emit("error", a), k = c.require("domain"), h.length = 0, k.active = b.domain = null
+                                } catch (f) {
+                                        e === k.active && h.pop(), h.length ? (b.domain = k.active = h[h.length - 1], d = b._fatalException(f)) : d = !1
+                                }
+                        } else d = b.emit("uncaughtException",
+                                a); if (!d) try {
+                                b._exiting || (b._exiting = !0, b.emit("exit", 1))
+                        } catch (g) {}
+                        d && setImmediate(b._tickCallback);
+                        return d
+                }
+        };
+        var l;
+        e.processAssert = function () {
+                l = b.assert = function (a, b) {
+                        if (!a) throw Error(b || "assertion error");
+                }
+        };
+        e.processConfig = function () {
+                var a = c._source.config;
+                delete c._source.config;
+                a = a.split("\n").slice(1).join("\n").replace(/'/g, '"');
+                b.config = JSON.parse(a, function (a, b) {
+                        return "true" === b ? !0 : "false" === b ? !1 : b
+                })
+        };
+        e.processNextTick = function () {
+                function a(a, b) {
+                        this.callback = a;
+                        this.domain = b
+                }
 
-  startup.processChannel = function() {
-    // If we were spawned with env NODE_CHANNEL_FD then load that up and
-    // start parsing data from that stream.
-    if (process.env.NODE_CHANNEL_FD) {
-      var fd = parseInt(process.env.NODE_CHANNEL_FD, 10);
-      assert(fd >= 0);
-
-      // Make sure it's not accidentally inherited by child processes.
-      delete process.env.NODE_CHANNEL_FD;
-
-      var cp = NativeModule.require('child_process');
-
-      // Load tcp_wrap to avoid situation where we might immediately receive
-      // a message.
-      // FIXME is this really necessary?
-      process.binding('tcp_wrap');
-
-      cp._forkChild(fd);
-      assert(process.send);
-    }
-  }
-
-  startup.resolveArgv0 = function() {
-    var cwd = process.cwd();
-    var isWindows = process.platform === 'win32';
-
-    // Make process.argv[0] into a full path, but only touch argv[0] if it's
-    // not a system $PATH lookup.
-    // TODO: Make this work on Windows as well.  Note that "node" might
-    // execute cwd\node.exe, or some %PATH%\node.exe on Windows,
-    // and that every directory has its own cwd, so d:node.exe is valid.
-    var argv0 = process.argv[0];
-    if (!isWindows && argv0.indexOf('/') !== -1 && argv0.charAt(0) !== '/') {
-      var path = NativeModule.require('path');
-      process.argv[0] = path.join(cwd, process.argv[0]);
-    }
-  };
-
-  // Below you find a minimal module system, which is used to load the node
-  // core modules found in lib/*.js. All core modules are compiled into the
-  // node binary, so they can be loaded faster.
-
-  var Script = process.binding('evals').NodeScript;
-  var runInThisContext = Script.runInThisContext;
-
-  function NativeModule(id) {
-    this.filename = id + '.js';
-    this.id = id;
-    this.exports = {};
-    this.loaded = false;
-  }
-
-  NativeModule._source = process.binding('natives');
-  NativeModule._cache = {};
-
-  NativeModule.require = function(id) {
-    if (id == 'native_module') {
-      return NativeModule;
-    }
-
-    var cached = NativeModule.getCached(id);
-    if (cached) {
-      return cached.exports;
-    }
-
-    if (!NativeModule.exists(id)) {
-      throw new Error('No such native module ' + id);
-    }
-
-    process.moduleLoadList.push('NativeModule ' + id);
-
-    var nativeModule = new NativeModule(id);
-
-    nativeModule.cache();
-    nativeModule.compile();
-
-    return nativeModule.exports;
-  };
-
-  NativeModule.getCached = function(id) {
-    return NativeModule._cache[id];
-  }
-
-  NativeModule.exists = function(id) {
-    return NativeModule._source.hasOwnProperty(id);
-  }
-
-  NativeModule.getSource = function(id) {
-    return NativeModule._source[id];
-  }
-
-  NativeModule.wrap = function(script) {
-    return NativeModule.wrapper[0] + script + NativeModule.wrapper[1];
-  };
-
-  NativeModule.wrapper = [
-    '(function (exports, require, module, __filename, __dirname) { ',
-    '\n});'
-  ];
-
-  NativeModule.prototype.compile = function() {
-    var source = NativeModule.getSource(this.id);
-    source = NativeModule.wrap(source);
-
-    var fn = runInThisContext(source, this.filename, 0, true);
-    fn(this.exports, NativeModule.require, this, this.filename);
-
-    this.loaded = true;
-  };
-
-  NativeModule.prototype.cache = function() {
-    NativeModule._cache[this.id] = this;
-  };
-
-  startup();
+                function d() {
+                        0 !==
+                                f[g] && (f[g] <= f[j] ? (e = [], f[g] = 0) : (e.splice(0, f[j]), f[g] = e.length));
+                        h = !1;
+                        f[j] = 0
+                }
+                var c = !1,
+                        e = [],
+                        h = !1,
+                        f = b._tickInfoBox,
+                        g = 0,
+                        j = 1;
+                b.nextTick = function (d) {
+                        b._exiting || (e.push(new a(d, null)), f[g]++)
+                };
+                b._nextDomainTick = function (d) {
+                        b._exiting || (e.push(new a(d, b.domain)), f[g]++)
+                };
+                b._tickCallback = function () {
+                        var a, b;
+                        if (!h)
+                                if (0 === f[g]) f[j] = 0;
+                                else {
+                                        for (h = !0; f[j] < f[g];) {
+                                                a = e[f[j]++].callback;
+                                                b = !0;
+                                                try {
+                                                        a(), b = !1
+                                                } finally {
+                                                        b && d()
+                                                }
+                                        }
+                                        d()
+                                }
+                };
+                b._tickDomainCallback = function () {
+                        var a, b;
+                        if (c) c = !1;
+                        else if (!h)
+                                if (0 === f[g]) f[j] = 0;
+                                else {
+                                        for (h = !0; f[j] < f[g];) {
+                                                a = e[f[j]++];
+                                                b = a.callback;
+                                                if (a.domain) {
+                                                        if (a.domain._disposed) continue;
+                                                        a.domain.enter()
+                                                }
+                                                c = !0;
+                                                try {
+                                                        b(), c = !1
+                                                } finally {
+                                                        c && d()
+                                                }
+                                                a.domain && a.domain.exit()
+                                        }
+                                        d()
+                                }
+                }
+        };
+        e.processStdio = function () {
+                var a, d, e;
+                b.__defineGetter__("stdout", function () {
+                        if (d) return d;
+                        d = n(1);
+                        d.destroy = d.destroySoon = function (a) {
+                                a = a || Error("process.stdout cannot be closed.");
+                                d.emit("error", a)
+                        };
+                        if (d.isTTY) b.on("SIGWINCH", function () {
+                                d._refreshSize()
+                        });
+                        return d
+                });
+                b.__defineGetter__("stderr", function () {
+                        if (e) return e;
+                        e = n(2);
+                        e.destroy =
+                                e.destroySoon = function (a) {
+                                a = a || Error("process.stderr cannot be closed.");
+                                e.emit("error", a)
+                        };
+                        return e
+                });
+                b.__defineGetter__("stdin", function () {
+                        if (a) return a;
+                        switch (b.binding("tty_wrap").guessHandleType(0)) {
+                        case "TTY":
+                                a = new(c.require("tty").ReadStream)(0, {
+                                                highWaterMark: 0,
+                                                readable: !0,
+                                                writable: !1
+                                        });
+                                break;
+                        case "FILE":
+                                a = new(c.require("fs").ReadStream)(null, {
+                                                fd: 0
+                                        });
+                                break;
+                        case "PIPE":
+                        case "TCP":
+                                a = new(c.require("net").Socket)({
+                                                fd: 0,
+                                                readable: !0,
+                                                writable: !1
+                                        });
+                                break;
+                        default:
+                                throw Error("Implement me. Unknown stdin file type!");
+                        }
+                        a.fd = 0;
+                        a._handle && a._handle.readStop && (a._handle.reading = !1, a._readableState.reading = !1, a._handle.readStop());
+                        a.on("pause", function () {
+                                a._handle && (a._readableState.reading = !1, a._handle.reading = !1, a._handle.readStop())
+                        });
+                        return a
+                });
+                b.openStdin = function () {
+                        b.stdin.resume();
+                        return b.stdin
+                }
+        };
+        e.processKillAndExit = function () {
+                b.exit = function (a) {
+                        b._exiting || (b._exiting = !0, b.emit("exit", a || 0));
+                        b.reallyExit(a || 0)
+                };
+                b.kill = function (a, d) {
+                        var c;
+                        if (0 === d) c = b._kill(a, 0);
+                        else if (d = d || "SIGTERM", e.lazyConstants()[d]) c =
+                                b._kill(a, e.lazyConstants()[d]);
+                        else throw Error("Unknown signal: " + d); if (c) throw m(b._errno, "kill");
+                        return !0
+                }
+        };
+        e.processSignalHandlers = function () {
+                var a = {}, d = b.addListener,
+                        c = b.removeListener;
+                b.on = b.addListener = function (c, h) {
+                        if ("SIG" === c.slice(0, 3) && e.lazyConstants().hasOwnProperty(c) && !a.hasOwnProperty(c)) {
+                                var f = new(b.binding("signal_wrap").Signal);
+                                f.unref();
+                                f.onsignal = function () {
+                                        b.emit(c)
+                                };
+                                var g = e.lazyConstants()[c];
+                                if (f.start(g)) throw f.close(), m(b._errno, "uv_signal_start");
+                                a[c] = f
+                        }
+                        return d.apply(this,
+                                arguments)
+                };
+                b.removeListener = function (b, d) {
+                        var f = c.apply(this, arguments);
+                        "SIG" === b.slice(0, 3) && e.lazyConstants().hasOwnProperty(b) && (l(a.hasOwnProperty(b)), 0 === this.listeners(b).length && (a[b].close(), delete a[b]));
+                        return f
+                }
+        };
+        e.processChannel = function () {
+                if (b.env.NODE_CHANNEL_FD) {
+                        var a = parseInt(b.env.NODE_CHANNEL_FD, 10);
+                        l(0 <= a);
+                        delete b.env.NODE_CHANNEL_FD;
+                        var d = c.require("child_process");
+                        b.binding("tcp_wrap");
+                        d._forkChild(a);
+                        l(b.send)
+                }
+        };
+        e.resolveArgv0 = function () {
+                var a = b.cwd(),
+                        d = b.argv[0];
+                "win32" !==
+                        b.platform && (-1 !== d.indexOf("/") && "/" !== d.charAt(0)) && (d = c.require("path"), b.argv[0] = d.join(a, b.argv[0]))
+        };
+        var p = b.binding("evals").NodeScript.runInThisContext;
+        c._source = b.binding("natives");
+        c._cache = {};
+        c.require = function (a) {
+                if ("native_module" == a) return c;
+                var d = c.getCached(a);
+                if (d) return d.exports;
+                if (!c.exists(a)) throw Error("No such native module " + a);
+                b.moduleLoadList.push("NativeModule " + a);
+                a = new c(a);
+                a.cache();
+                a.compile();
+                return a.exports
+        };
+        c.getCached = function (a) {
+                return c._cache[a]
+        };
+        c.exists = function (a) {
+                return c._source.hasOwnProperty(a)
+        };
+        c.getSource = function (a) {
+                return c._source[a]
+        };
+        c.wrap = function (a) {
+                return c.wrapper[0] + a + c.wrapper[1]
+        };
+        c.wrapper = ["(function (exports, require, module, __filename, __dirname) { ", "\n});"];
+        c.prototype.compile = function () {
+                var a = c.getSource(this.id),
+                        a = c.wrap(a);
+                p(a, this.filename, 0, !0)(this.exports, c.require, this, this.filename);
+                this.loaded = !0
+        };
+        c.prototype.cache = function () {
+                c._cache[this.id] = this
+        };
+        e()
 });
